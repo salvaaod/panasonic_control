@@ -10,18 +10,19 @@ and polls:
   /live/camdata.html
 
 Default camera:
-  192.168.101.30
+  192.168.103.30
 
 Dependencies:
   pip install requests
 """
 
 import queue
+import re
 import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass, field
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import Dict, List, Optional, Tuple
 
 import requests  # type: ignore[import-untyped]
@@ -101,6 +102,7 @@ class CameraClient:
         self.password = password
         self.auth = None
         self.auth_name = "none"
+        self.lock = threading.Lock()
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "AW-ImageAdjust-Tk/1.0",
@@ -108,31 +110,26 @@ class CameraClient:
             "Connection": "close",
         })
 
+    def update_settings(self, ip: str, username: str, password: str):
+        with self.lock:
+            self.ip = ip
+            self.base = f"http://{ip}"
+            self.username = username
+            self.password = password
+            self.auth = None
+            self.auth_name = "none"
+            self.session.close()
+            self.session = requests.Session()
+            self.session.headers.update({
+                "User-Agent": "AW-ImageAdjust-Tk/1.0",
+                "Connection": "close",
+            })
+
     def request(self, path: str, params: Optional[dict] = None) -> dict:
-        url = self.base + path
-        start = time.monotonic()
-        try:
-            r = self.session.get(
-                url,
-                params=params,
-                auth=self.auth,
-                timeout=HTTP_TIMEOUT,
-                allow_redirects=False,
-            )
-
-            if r.status_code == 401:
-                www = r.headers.get("WWW-Authenticate", "").lower()
-                if "digest" in www:
-                    self.auth = HTTPDigestAuth(self.username, self.password)
-                    self.auth_name = "digest"
-                elif "basic" in www:
-                    self.auth = HTTPBasicAuth(self.username, self.password)
-                    self.auth_name = "basic"
-                else:
-                    self.auth = None
-                    self.auth_name = "unknown"
-
-                start = time.monotonic()
+        with self.lock:
+            url = self.base + path
+            start = time.monotonic()
+            try:
                 r = self.session.get(
                     url,
                     params=params,
@@ -141,23 +138,44 @@ class CameraClient:
                     allow_redirects=False,
                 )
 
-            elapsed_ms = (time.monotonic() - start) * 1000.0
-            return {
-                "ok": True,
-                "url": r.url,
-                "status": r.status_code,
-                "reason": r.reason,
-                "elapsed_ms": elapsed_ms,
-                "headers": dict(r.headers),
-                "body": r.text.strip(),
-                "auth": self.auth_name,
-            }
-        except Exception as e:
-            return {
-                "ok": False,
-                "url": url,
-                "error": f"{type(e).__name__}: {e}",
-            }
+                if r.status_code == 401:
+                    www = r.headers.get("WWW-Authenticate", "").lower()
+                    if "digest" in www:
+                        self.auth = HTTPDigestAuth(self.username, self.password)
+                        self.auth_name = "digest"
+                    elif "basic" in www:
+                        self.auth = HTTPBasicAuth(self.username, self.password)
+                        self.auth_name = "basic"
+                    else:
+                        self.auth = None
+                        self.auth_name = "unknown"
+
+                    start = time.monotonic()
+                    r = self.session.get(
+                        url,
+                        params=params,
+                        auth=self.auth,
+                        timeout=HTTP_TIMEOUT,
+                        allow_redirects=False,
+                    )
+
+                elapsed_ms = (time.monotonic() - start) * 1000.0
+                return {
+                    "ok": True,
+                    "url": r.url,
+                    "status": r.status_code,
+                    "reason": r.reason,
+                    "elapsed_ms": elapsed_ms,
+                    "headers": dict(r.headers),
+                    "body": r.text.strip(),
+                    "auth": self.auth_name,
+                }
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "url": url,
+                    "error": f"{type(e).__name__}: {e}",
+                }
 
     def aw_cam(self, cmd: str) -> dict:
         return self.request("/cgi-bin/aw_cam", {"cmd": cmd, "res": "1"})
@@ -440,6 +458,9 @@ class ImageAdjustApp:
         self.poll_var = tk.StringVar(value="Last poll: never")
         self.error_var = tk.StringVar(value="No errors")
         self.log_success_polls_var = tk.BooleanVar(value=LOG_SUCCESSFUL_POLLS)
+        self.camera_ip_var = tk.StringVar(value=CAMERA_IP)
+        self.username_var = tk.StringVar(value=USERNAME)
+        self.password_var = tk.StringVar(value=PASSWORD)
 
         self.tk_vars: Dict[str, tk.Variable] = {}
         self.value_labels: Dict[str, ttk.Label] = {}
@@ -459,7 +480,7 @@ class ImageAdjustApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.log("App started")
-        self.log(f"Camera IP: {CAMERA_IP}")
+        self.log(f"Camera IP: {self.camera_ip_var.get()}")
         self.log("Polling /live/camdata.html every 200 ms")
 
     # --------------------------------------------------------
@@ -505,12 +526,24 @@ class ImageAdjustApp:
 
         status = ttk.Frame(main_frame, padding=(10, 6))
         status.pack(fill="x")
-        ttk.Label(status, text=f"Camera: http://{CAMERA_IP}").pack(side="left")
+        self.camera_status_var = tk.StringVar(value=f"Camera: http://{CAMERA_IP}")
+        ttk.Label(status, textvariable=self.camera_status_var).pack(side="left")
         ttk.Label(status, textvariable=self.model_var).pack(side="left", padx=(20, 0))
         ttk.Label(status, textvariable=self.auth_var).pack(side="left", padx=(20, 0))
         ttk.Label(status, textvariable=self.poll_var).pack(side="left", padx=(20, 0))
         self.conn_label = ttk.Label(status, textvariable=self.connected_var, style="Disconnected.TLabel")
         self.conn_label.pack(side="right")
+
+
+        settings = ttk.Frame(main_frame, padding=(10, 6))
+        settings.pack(fill="x")
+        ttk.Label(settings, text="Camera IP").pack(side="left")
+        ttk.Entry(settings, textvariable=self.camera_ip_var, width=18).pack(side="left", padx=(6, 14))
+        ttk.Label(settings, text="Username").pack(side="left")
+        ttk.Entry(settings, textvariable=self.username_var, width=14).pack(side="left", padx=(6, 14))
+        ttk.Label(settings, text="Password").pack(side="left")
+        ttk.Entry(settings, textvariable=self.password_var, width=16, show="*").pack(side="left", padx=(6, 14))
+        ttk.Button(settings, text="Apply camera settings", command=self.apply_camera_settings).pack(side="left")
 
         self.notebook = ttk.Notebook(main_frame)
         self.notebook.pack(fill="both", expand=True, padx=18, pady=(0, 6))
@@ -637,6 +670,30 @@ class ImageAdjustApp:
         combo = ttk.Combobox(row, textvariable=var, values=list(c.options.keys()), state="readonly", width=18)
         combo.pack(side="left")
         combo.bind("<<ComboboxSelected>>", lambda _e, cc=c: self._on_choice_changed(cc))
+
+
+    def apply_camera_settings(self):
+        ip = self.camera_ip_var.get().strip()
+        username = self.username_var.get().strip()
+        password = self.password_var.get()
+
+        if not self._is_valid_camera_host(ip):
+            messagebox.showerror("Invalid camera host", "Enter a valid IPv4 address or hostname.")
+            return
+
+        self.client.update_settings(ip, username, password)
+        self.camera_status_var.set(f"Camera: http://{ip}")
+        self.model_var.set("Model: unknown")
+        self.auth_var.set("Auth: none")
+        self.poll_var.set("Last poll: pending")
+        self.error_var.set("Camera settings updated")
+        self._set_connected(False)
+        self.log(f"Camera settings updated: http://{ip}")
+
+    def _is_valid_camera_host(self, value: str) -> bool:
+        if not value or "://" in value or any(ch.isspace() for ch in value):
+            return False
+        return re.fullmatch(r"[A-Za-z0-9.-]+", value) is not None
 
     # --------------------------------------------------------
     # User event handlers
